@@ -974,7 +974,7 @@ static void pgss_store(uint64 queryId,
 		}
 		e->counters.error.elevel = elevel;
 		e->counters.error.sqlcode = sqlcode;
-		for(i = 0; i < message_len; i++)
+		for(i = 0; i < message_len && i < ERROR_MESSAGE_LEN; i++)
 			e->counters.error.message[i] = message[i];
 
 		e->counters.calls[kind].rows += rows;

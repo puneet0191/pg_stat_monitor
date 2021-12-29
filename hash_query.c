@@ -22,6 +22,7 @@
 
 static pgssSharedState *pgss;
 static HTAB *pgss_hash;
+static HTAB *pgss_global_hash;
 
 static HTAB* hash_init(const char *hash_name, int key_size, int entry_size, int hash_size);
 /*
@@ -56,6 +57,7 @@ pgss_startup(void)
 
 	pgss = NULL;
 	pgss_hash = NULL;
+    pgss_global_hash = NULL;
 
 	/*
 	* Create or attach to the shared memory state, including hash table
@@ -84,6 +86,7 @@ pgss_startup(void)
 		memset(buf, 0, sizeof (uint64));
 	}
 
+	pgss_global_hash = hash_init("pg_stat_monitor: global hashtable", sizeof(pgssGlobalHashKey), sizeof(pgssGlobalEntry), MAX_BUCKET_ENTRIES);
 	pgss_hash = hash_init("pg_stat_monitor: bucket hashtable", sizeof(pgssHashKey), sizeof(pgssEntry), MAX_BUCKET_ENTRIES);
 
 	LWLockRelease(AddinShmemInitLock);
@@ -106,6 +109,13 @@ pgsm_get_hash(void)
 {
 	return pgss_hash;
 }
+
+HTAB*
+pgsm_get_global_hash(void)
+{
+	return pgss_global_hash;
+}
+
 
 /*
  * shmem_shutdown hook: Dump statistics into file.
@@ -133,10 +143,33 @@ hash_memsize(void)
 
 	size = MAXALIGN(sizeof(pgssSharedState));
 	size += MAXALIGN(MAX_QUERY_BUF);
+	size = add_size(size, hash_estimate_size(MAX_BUCKET_ENTRIES, sizeof(pgssGlobalEntry)));
 	size = add_size(size, hash_estimate_size(MAX_BUCKET_ENTRIES, sizeof(pgssEntry)));
 	size = add_size(size, hash_estimate_size(MAX_BUCKET_ENTRIES, sizeof(pgssQueryEntry)));
 
 	return size;
+}
+
+pgssGlobalEntry *
+hash_global_entry_alloc(pgssSharedState *pgss, pgssGlobalHashKey *key)
+{
+	pgssGlobalEntry	*entry = NULL;
+	bool		    found = false;
+
+	if (hash_get_num_entries(pgss_global_hash) >= MAX_BUCKET_ENTRIES)
+	{
+		elog(DEBUG1, "%s", "pg_stat_monitor: out of memory");
+		return NULL;
+	}
+
+	/* Find or create an entry with desired hash code */
+	entry = (pgssEntry *) hash_search(pgss_global_hash, key, HASH_ENTER_NULL, &found);
+	if (found == false)
+	{
+	}
+	if (entry == NULL)
+		elog(DEBUG1, "%s", "pg_stat_monitor: out of memory");
+	return entry;
 }
 
 pgssEntry *

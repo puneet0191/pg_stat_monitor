@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * pg_stat_monitor.c
+ * pg_stat_monitor_debug.c
  *		Track statement execution times across a whole database cluster.
  *
  * Portions Copyright © 2018-2020, Percona LLC and/or its affiliates
@@ -15,61 +15,18 @@
  *-------------------------------------------------------------------------
  */
 
+#ifdef BENCHMARK
 #include "postgres.h"
 #include "access/parallel.h"
 #include <regex.h>
+#include <time.h> /* clock() */
 #include "commands/explain.h"
 #include "pg_stat_monitor.h"
 
 PG_MODULE_MAGIC;
 
-#define BUILD_VERSION                   "1.0.0-rc.1"
-#define PG_STAT_STATEMENTS_COLS         53  /* maximum of above */
-#define PGSM_TEXT_FILE                  "/tmp/pg_stat_monitor_query"
-
-#define roundf(x,d) ((floor(((x)*pow(10,d))+.5))/pow(10,d))
-
-#define PGUNSIXBIT(val) (((val) & 0x3F) + '0')
-
-#define _snprintf(_str_dst, _str_src, _len, _max_len)\
-  memcpy((void *)_str_dst, _str_src, _len < _max_len ? _len : _max_len)
-
-#define _snprintf2(_str_dst, _str_src, _len1, _len2)\
-do                                                      \
-{                                                       \
-	int i;                                            \
-	for(i = 0; i < _len1; i++)                        \
-		strlcpy((char *)_str_dst[i], _str_src[i], _len2); \
-}while(0)
-
-/*---- Initicalization Function Declarations ----*/
-void _PG_init(void);
-void _PG_fini(void);
-
-/*---- Local variables ----*/
-
-/* Current nesting depth of ExecutorRun+ProcessUtility calls */
-static int	nested_level = 0;
-#if PG_VERSION_NUM >= 130000
-static int plan_nested_level = 0;
+static struct pg_hook_stats_t *pg_hook_stats;
 #endif
-
-static struct rusage  rusage_start;
-static struct rusage  rusage_end;
-
-/* The array to store outer layer query id*/
-uint64 *nested_queryids;
-
-/* Regex object used to extract query comments. */
-static regex_t preg_query_comments;
-static char relations[REL_LST][REL_LEN];
-static int num_relations;							/*  Number of relation in the query */
-static bool system_init = false;
-static unsigned char *pgss_qbuf[MAX_BUCKETS];
-static char *pgss_explain(QueryDesc *queryDesc);
-
-
-static uint64 CurrentUserID(pgssStoreKind k);
 
 static void extract_query_comments(const char *query, char *comments, size_t max_len);
 static int  get_histogram_bucket(double q_time);
@@ -77,7 +34,8 @@ static bool IsSystemInitialized(void);
 static bool dump_queries_buffer(int bucket_id, unsigned char *buf, int buf_len);
 static double time_diff(struct timeval end, struct timeval start);
 
-static void pgss_global_store(uint64 queryid, const char *query, CmdType cmd_type, JumbleState *jstate, pgssStoreKind kind);
+
+/* Saved hook values in case of unload */
 
 #if PG_VERSION_NUM >= 130000
 static planner_hook_type planner_hook_next = NULL;
@@ -184,6 +142,19 @@ static void fill_in_constant_lengths(JumbleState *jstate, const char *query, int
 static int comp_location(const void *a, const void *b);
 
 static uint64 get_next_wbucket(pgssSharedState *pgss);
+
+static void
+pgss_store_query(uint64 queryid,
+                  const char * query,
+				  CmdType cmd_type,
+				  int query_location,
+				  int query_len,
+#if PG_VERSION_NUM > 130000
+				  JumbleState *jstate,
+#else
+				  JumbleState *jstate,
+#endif
+				  pgssStoreKind kind);
 
 #if PG_VERSION_NUM < 140000
 static uint64 get_query_id(JumbleState *jstate, Query *query);
@@ -326,6 +297,16 @@ pg_stat_monitor_version(PG_FUNCTION_ARGS)
 }
 
 #if PG_VERSION_NUM >= 140000
+#ifdef BENCHMARK
+static void
+pgss_post_parse_analyze_benchmark(ParseState *pstate, Query *query, JumbleState *jstate)
+{
+	double start_time = (double)clock();
+	pgss_post_parse_analyze(pstate, query, jstate);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_POST_PARSE_ANALYZE, elapsed);
+}
+#endif
 /*
  * Post-parse-analysis hook: mark query with a queryId
  */
@@ -364,15 +345,26 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 	 */
 	if (jstate == NULL || jstate->clocations_count <= 0)
 		return;
-
-    pgss_global_store(query->queryId,          /* queryid */
-               pstate->p_sourcetext,           /* query */
-               query->commandType,             /* CmdType */
-               jstate,                         /* JumbleState */
-			   kind);						   /*pgssStoreKind */
+	pgss_store_query(query->queryId,          /* queryid */
+               pstate->p_sourcetext,          /* query */
+               query->commandType,            /* CmdType */
+			   query->stmt_location,		  /* Query Location */
+               query->stmt_len,			  	  /* Query Len */
+               jstate,                       /* JumbleState */
+			   kind);						  /*pgssStoreKind */
 }
 #else
 
+#ifdef BENCHMARK
+static void
+pgss_post_parse_analyze_benchmark(ParseState *pstate, Query *query)
+{
+	double start_time = (double)clock();
+	pgss_post_parse_analyze(pstate, query);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_POST_PARSE_ANALYZE, elapsed);
+}
+#endif
 /*
  * Post-parse-analysis hook: mark query with a queryId
  */
@@ -418,11 +410,24 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query)
 	if (jstate.clocations_count <= 0)
 		return;
 
-    pgss_global_store(query->queryId,          /* queryid */
-               pstate->p_sourcetext,           /* query */
-               query->commandType,             /* CmdType */
-               jstate,                         /* JumbleState */
-			   kind);						   /*pgssStoreKind */
+	pgss_store_query(query->queryId,          /* queryid */
+               pstate->p_sourcetext,          /* query */
+               query->commandType,            /* CmdType */
+			   query->stmt_location,		  /* Query Location */
+               query->stmt_len,			  	  /* Query Len */
+               &jstate,                       /* JumbleState */
+			   kind);						  /*pgssStoreKind */
+}
+#endif
+
+#ifdef BENCHMARK
+static void
+pgss_ExecutorStart_benchmark(QueryDesc *queryDesc, int eflags)
+{
+	double start_time = (double)clock();
+	pgss_ExecutorStart(queryDesc, eflags);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_EXECUTORSTART, elapsed);
 }
 #endif
 /*
@@ -468,8 +473,36 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 #endif
 			MemoryContextSwitchTo(oldcxt);
 		}
+		pgss_store(queryId,                                 /* query id */
+					queryDesc->sourceText,					/* query text */
+					NULL,                                   /* PlanInfo */
+					queryDesc->operation,                   /* CmdType */
+					NULL,                                   /* SysInfo */
+					NULL,									/* ErrorInfo */
+					0,                                      /* totaltime */
+					0,                                      /* rows */
+					NULL,                                   /*  bufusage */
+#if PG_VERSION_NUM >= 130000
+					NULL,                                   /* walusage */
+#else
+					NULL,
+#endif
+					NULL,
+					PGSS_EXEC);							   /* pgssStoreKind */
 	}
 }
+
+#ifdef BENCHMARK
+static void
+pgss_ExecutorRun_benchmark(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
+				 bool execute_once)
+{
+	double start_time = (double)clock();
+	pgss_ExecutorRun(queryDesc, direction, count, execute_once);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_EXECUTORUN, elapsed);
+}
+#endif
 
 /*
  * ExecutorRun hook: all we need do is track nesting depth
@@ -500,6 +533,17 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
 	}
 	PG_END_TRY();
 }
+
+#ifdef BENCHMARK
+static void
+pgss_ExecutorFinish_benchmark(QueryDesc *queryDesc)
+{
+	double start_time = (double)clock();
+	pgss_ExecutorFinish(queryDesc);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_EXECUTORFINISH, elapsed);
+}
+#endif
 
 /*
  * ExecutorFinish hook: all we need do is track nesting depth
@@ -544,6 +588,16 @@ pgss_explain(QueryDesc *queryDesc)
     return es->str->data;
 }
 
+#ifdef BENCHMARK
+static void
+pgss_ExecutorEnd_benchmark(QueryDesc *queryDesc)
+{
+	double start_time = (double)clock();
+	pgss_ExecutorEnd(queryDesc);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_EXECUTOREND, elapsed);
+}
+#endif
 
 /*
  * ExecutorEnd hook: store results if needed
@@ -602,6 +656,18 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
 	num_relations = 0;
 }
 
+#ifdef BENCHMARK
+static bool
+pgss_ExecutorCheckPerms_benchmark(List *rt, bool abort)
+{
+	bool ret;
+	double start_time = (double)clock();
+	ret = pgss_ExecutorCheckPerms(rt, abort);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_EXECUTORCHECKPERMS, elapsed);
+	return ret;
+}
+#endif
 
 static bool
 pgss_ExecutorCheckPerms(List *rt, bool abort)
@@ -651,6 +717,18 @@ pgss_ExecutorCheckPerms(List *rt, bool abort)
 }
 
 #if PG_VERSION_NUM >= 130000
+#ifdef BENCHMARK
+static PlannedStmt*
+pgss_planner_hook_benchmark(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams)
+{
+	PlannedStmt *ret;
+	double start_time = (double)clock();
+	ret = pgss_planner_hook(parse, query_string, cursorOptions, boundParams);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_PLANNER_HOOK, elapsed);
+	return ret;
+}
+#endif
 static PlannedStmt*
 pgss_planner_hook(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams)
 {
@@ -744,6 +822,21 @@ pgss_planner_hook(Query *parse, const char *query_string, int cursorOptions, Par
  * ProcessUtility hook
  */
 #if PG_VERSION_NUM >= 140000
+#ifdef BENCHMARK
+static void
+pgss_ProcessUtility_benchmark(PlannedStmt *pstmt, const char *queryString,
+                                bool readOnlyTree,
+								ProcessUtilityContext context,
+								ParamListInfo params, QueryEnvironment *queryEnv,
+								DestReceiver *dest,
+								QueryCompletion *qc)
+{
+	double start_time = (double)clock();
+	pgss_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_PROCESSUTILITY, elapsed);
+}
+#endif
 static void pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
                                 bool readOnlyTree,
 								ProcessUtilityContext context,
@@ -752,6 +845,20 @@ static void pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 								QueryCompletion *qc)
 
 #elif PG_VERSION_NUM >= 130000
+#ifdef BENCHMARK
+static void
+pgss_ProcessUtility_benchmark(PlannedStmt *pstmt, const char *queryString,
+								ProcessUtilityContext context,
+								ParamListInfo params, QueryEnvironment *queryEnv,
+								DestReceiver *dest,
+								QueryCompletion *qc)
+{
+	double start_time = (double)clock();
+	pgss_ProcessUtility(pstmt, queryString, context, params, queryEnv, dest, qc);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_PROCESSUTILITY, elapsed);
+}
+#endif
 static void pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 								ProcessUtilityContext context,
 								ParamListInfo params, QueryEnvironment *queryEnv,
@@ -759,6 +866,20 @@ static void pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 								QueryCompletion *qc)
 
 #else
+#ifdef BENCHMARK
+static void
+pgss_ProcessUtility_benchmark(PlannedStmt *pstmt, const char *queryString,
+                                ProcessUtilityContext context, ParamListInfo params,
+                                QueryEnvironment *queryEnv,
+                                DestReceiver *dest,
+                                char *completionTag)
+{
+	double start_time = (double)clock();
+	pgss_ProcessUtility(pstmt, queryString, context, params, queryEnv, dest, completionTag);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSS_PROCESSUTILITY, elapsed);
+}
+#endif
 static void pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
                                 ProcessUtilityContext context, ParamListInfo params,
                                 QueryEnvironment *queryEnv,
@@ -1160,6 +1281,72 @@ pgss_update_entry(pgssEntry *entry,
 }
 
 static void
+pgss_store_query(uint64 queryid,
+                  const char * query,
+				  CmdType cmd_type,
+				  int query_location,
+				  int query_len,
+#if PG_VERSION_NUM > 130000
+				  JumbleState *jstate,
+#else
+				  JumbleState *jstate,
+#endif
+				  pgssStoreKind kind)
+{
+	char *norm_query = NULL;
+
+	if (query_location >= 0)
+	{
+		Assert(query_location <= strlen(query));
+		query += query_location;
+		/* Length of 0 (or -1) means "rest of string" */
+		if (query_len <= 0)
+			query_len = strlen(query);
+		else
+			Assert(query_len <= strlen(query));
+	}
+	else
+	{
+		/* If query location is unknown, distrust query_len as well */
+		query_location = 0;
+		query_len = strlen(query);
+	}
+
+	/*
+	 * Discard leading and trailing whitespace, too.  Use scanner_isspace()
+	 * not libc's isspace(), because we want to match the lexer's behavior.
+	 */
+	while (query_len > 0 && scanner_isspace(query[0]))
+		query++, query_location++, query_len--;
+	while (query_len > 0 && scanner_isspace(query[query_len - 1]))
+		query_len--;
+
+	if (jstate)
+		norm_query = generate_normalized_query(jstate, query,
+											   query_location,
+											   &query_len,
+											   GetDatabaseEncoding());
+	/*
+     * For utility statements, we just hash the query string to get an ID.
+     */
+	if (queryid == UINT64CONST(0))
+		queryid = pgss_hash_string(query, query_len);
+
+	pgss_store(queryid,                 /* query id */
+				PGSM_NORMALIZED_QUERY ? (norm_query ? norm_query : query) : query, /* query */
+				NULL,					/* PlanInfo */
+				cmd_type,				/* CmdType */
+				NULL,					/* SysInfo */
+				NULL,					/* ErrorInfo */
+				0,						/* totaltime */
+				0,						/* rows */
+				NULL,					/*  bufusage */
+				NULL,					/* walusage */
+				jstate,					/* JumbleState */
+				kind);					/* pgssStoreKind */
+}
+
+static void
 pgss_store_error(uint64 queryid,
 				const char * query,
 				ErrorData *edata)
@@ -1207,57 +1394,6 @@ pgss_store_utility(const char *query,
 				PGSS_FINISHED);			/* pgssStoreKind */
 }
 
-
-
-static void
-pgss_global_store(uint64 queryid,
-			const char *query,
-			CmdType cmd_type,
-			JumbleState *jstate,
-			pgssStoreKind kind)
-{
-	HTAB                  *pgss_global_hash;
-	pgssGlobalHashKey     globalKey;
-	pgssGlobalEntry       *globalEntry;
-	pgssSharedState       *pgss = pgsm_get_ss();
-	char                  application_name[APPLICATIONNAME_LEN];
-	int                   application_name_len;
-    uint64                userid = CurrentUserID(kind);
-	uint64                appid;
-	char                  comments[512] = "";
-
-	application_name_len = pg_get_application_name(application_name);
-	appid = djb2_hash((unsigned char *)application_name, application_name_len);
-
-	extract_query_comments(query, comments, sizeof(comments));
-
-    /* Build Global key */
-	globalKey.userid       = userid;
-	globalKey.dbid         = MyDatabaseId;
-	globalKey.queryid      = queryid;
-	globalKey.ip           = pg_get_client_addr();
-	globalKey.appid        = appid;
-    globalKey.toplevel     = 1;
-	pgss_global_hash       = pgsm_get_global_hash();
-
-	LWLockAcquire(pgss->lock, LW_SHARED);
-
-	globalEntry = (pgssGlobalEntry *) hash_search(pgss_global_hash, &globalKey, HASH_FIND, NULL);
-	if (globalEntry == NULL)
-	{
-		 /* OK to create a new Global hashtable entry */
-		globalEntry = hash_global_entry_alloc(pgss, &globalKey);
-		if (globalEntry == NULL)
-		{
-			LWLockRelease(pgss->lock);
-			elog(DEBUG1, "pg_stat_monitor: out of memory");
-			return;
-		}
-        /* Set the start time of the query only */
-
-	}
-	LWLockRelease(pgss->lock);
-}
 /*
  * Store some statistics for a statement.
  *
@@ -2357,631 +2493,12 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			}
 			break;
 		case T_CoerceToDomainValue:
-			{
-				CoerceToDomainValue *cdv = (CoerceToDomainValue *) node;
-
-				APP_JUMB(cdv->typeId);
-			}
-			break;
-		case T_SetToDefault:
-			{
-				SetToDefault *sd = (SetToDefault *) node;
-
-				APP_JUMB(sd->typeId);
-			}
-			break;
-		case T_CurrentOfExpr:
-			{
-				CurrentOfExpr *ce = (CurrentOfExpr *) node;
-
-				APP_JUMB(ce->cvarno);
-				if (ce->cursor_name)
-					APP_JUMB_STRING(ce->cursor_name);
-				APP_JUMB(ce->cursor_param);
-			}
-			break;
-		case T_NextValueExpr:
-			{
-				NextValueExpr *nve = (NextValueExpr *) node;
-
-				APP_JUMB(nve->seqid);
-				APP_JUMB(nve->typeId);
-			}
-			break;
-		case T_InferenceElem:
-			{
-				InferenceElem *ie = (InferenceElem *) node;
-
-				APP_JUMB(ie->infercollid);
-				APP_JUMB(ie->inferopclass);
-				JumbleExpr(jstate, ie->expr);
-			}
-			break;
-		case T_TargetEntry:
-			{
-				TargetEntry *tle = (TargetEntry *) node;
-
-				APP_JUMB(tle->resno);
-				APP_JUMB(tle->ressortgroupref);
-				JumbleExpr(jstate, (Node *) tle->expr);
-			}
-			break;
-		case T_RangeTblRef:
-			{
-				RangeTblRef *rtr = (RangeTblRef *) node;
-
-				APP_JUMB(rtr->rtindex);
-			}
-			break;
-		case T_JoinExpr:
-			{
-				JoinExpr   *join = (JoinExpr *) node;
-
-				APP_JUMB(join->jointype);
-				APP_JUMB(join->isNatural);
-				APP_JUMB(join->rtindex);
-				JumbleExpr(jstate, join->larg);
-				JumbleExpr(jstate, join->rarg);
-				JumbleExpr(jstate, join->quals);
-			}
-			break;
-		case T_FromExpr:
-			{
-				FromExpr   *from = (FromExpr *) node;
-
-				JumbleExpr(jstate, (Node *) from->fromlist);
-				JumbleExpr(jstate, from->quals);
-			}
-			break;
-		case T_OnConflictExpr:
-			{
-				OnConflictExpr *conf = (OnConflictExpr *) node;
-
-				APP_JUMB(conf->action);
-				JumbleExpr(jstate, (Node *) conf->arbiterElems);
-				JumbleExpr(jstate, conf->arbiterWhere);
-				JumbleExpr(jstate, (Node *) conf->onConflictSet);
-				JumbleExpr(jstate, conf->onConflictWhere);
-				APP_JUMB(conf->constraint);
-				APP_JUMB(conf->exclRelIndex);
-				JumbleExpr(jstate, (Node *) conf->exclRelTlist);
-			}
-			break;
-		case T_List:
-			foreach(temp, (List *) node)
-			{
-				JumbleExpr(jstate, (Node *) lfirst(temp));
-			}
-			break;
-		case T_IntList:
-			foreach(temp, (List *) node)
-			{
-				APP_JUMB(lfirst_int(temp));
-			}
-			break;
-		case T_SortGroupClause:
-			{
-				SortGroupClause *sgc = (SortGroupClause *) node;
-
-				APP_JUMB(sgc->tleSortGroupRef);
-				APP_JUMB(sgc->eqop);
-				APP_JUMB(sgc->sortop);
-				APP_JUMB(sgc->nulls_first);
-			}
-			break;
-		case T_GroupingSet:
-			{
-				GroupingSet *gsnode = (GroupingSet *) node;
-
-				JumbleExpr(jstate, (Node *) gsnode->content);
-			}
-			break;
-		case T_WindowClause:
-			{
-				WindowClause *wc = (WindowClause *) node;
-
-				APP_JUMB(wc->winref);
-				APP_JUMB(wc->frameOptions);
-				JumbleExpr(jstate, (Node *) wc->partitionClause);
-				JumbleExpr(jstate, (Node *) wc->orderClause);
-				JumbleExpr(jstate, wc->startOffset);
-				JumbleExpr(jstate, wc->endOffset);
-			}
-			break;
-		case T_CommonTableExpr:
-			{
-				CommonTableExpr *cte = (CommonTableExpr *) node;
-
-				/* we store the string name because RTE_CTE RTEs need it */
-				APP_JUMB_STRING(cte->ctename);
-				JumbleQuery(jstate, castNode(Query, cte->ctequery));
-			}
-			break;
-		case T_SetOperationStmt:
-			{
-				SetOperationStmt *setop = (SetOperationStmt *) node;
-
-				APP_JUMB(setop->op);
-				APP_JUMB(setop->all);
-				JumbleExpr(jstate, setop->larg);
-				JumbleExpr(jstate, setop->rarg);
-			}
-			break;
-		case T_RangeTblFunction:
-			{
-				RangeTblFunction *rtfunc = (RangeTblFunction *) node;
-
-				JumbleExpr(jstate, rtfunc->funcexpr);
-			}
-			break;
-		case T_TableFunc:
-			{
-				TableFunc  *tablefunc = (TableFunc *) node;
-
-				JumbleExpr(jstate, tablefunc->docexpr);
-				JumbleExpr(jstate, tablefunc->rowexpr);
-				JumbleExpr(jstate, (Node *) tablefunc->colexprs);
-			}
-			break;
-		case T_TableSampleClause:
-			{
-				TableSampleClause *tsc = (TableSampleClause *) node;
-
-				APP_JUMB(tsc->tsmhandler);
-				JumbleExpr(jstate, (Node *) tsc->args);
-				JumbleExpr(jstate, (Node *) tsc->repeatable);
-			}
-			break;
-		default:
-			/* Only a warning, since we can stumble along anyway */
-			elog(INFO, "unrecognized node type: %d",
-				 (int) nodeTag(node));
-			break;
-	}
-}
-/*
- * Record location of constant within query string of query tree
- * that is currently being walked.
- */
-static void
-RecordConstLocation(JumbleState *jstate, int location)
-{
-	/* -1 indicates unknown or undefined location */
-	if (location >= 0)
-	{
-		/* enlarge array if needed */
-		if (jstate->clocations_count >= jstate->clocations_buf_size)
-		{
-			jstate->clocations_buf_size *= 2;
-			jstate->clocations = (LocationLen *)
-				repalloc(jstate->clocations,
-						 jstate->clocations_buf_size *
-						 sizeof(LocationLen));
 		}
 		jstate->clocations[jstate->clocations_count].location = location;
 		/* initialize lengths to -1 to simplify fill_in_constant_lengths */
 		jstate->clocations[jstate->clocations_count].length = -1;
 		jstate->clocations_count++;
 	}
-}
-#endif
-
-/*
- * Generate a normalized version of the query string that will be used to
- * represent all similar queries.
- *
- * Note that the normalized representation may well vary depending on
- * just which "equivalent" query is used to create the hashtable entry.
- * We assume this is OK.
- *
- * If query_loc > 0, then "query" has been advanced by that much compared to
- * the original string start, so we need to translate the provided locations
- * to compensate.  (This lets us avoid re-scanning statements before the one
- * of interest, so it's worth doing.)
- *
- * *query_len_p contains the input string length, and is updated with
- * the result string length on exit.  The resulting string might be longer
- * or shorter depending on what happens with replacement of constants.
- *
- * Returns a palloc'd string.
- */
-static char *
-generate_normalized_query(JumbleState *jstate, const char *query,
-						  int query_loc, int *query_len_p, int encoding)
-{
-	char	   *norm_query;
-	int			query_len = *query_len_p;
-	int			i,
-				norm_query_buflen,	/* Space allowed for norm_query */
-				len_to_wrt,		/* Length (in bytes) to write */
-				quer_loc = 0,	/* Source query byte location */
-				n_quer_loc = 0, /* Normalized query byte location */
-				last_off = 0,	/* Offset from start for previous tok */
-				last_tok_len = 0;	/* Length (in bytes) of that tok */
-
-	/*
-	 * Get constants' lengths (core system only gives us locations).  Note
-	 * this also ensures the items are sorted by location.
-	 */
-	fill_in_constant_lengths(jstate, query, query_loc);
-
-	/*
-	 * Allow for $n symbols to be longer than the constants they replace.
-	 * Constants must take at least one byte in text form, while a $n symbol
-	 * certainly isn't more than 11 bytes, even if n reaches INT_MAX.  We
-	 * could refine that limit based on the max value of n for the current
-	 * query, but it hardly seems worth any extra effort to do so.
-	 */
-	norm_query_buflen = query_len + jstate->clocations_count * 10;
-
-	/* Allocate result buffer */
-	norm_query = palloc(norm_query_buflen + 1);
-
-	for (i = 0; i < jstate->clocations_count; i++)
-	{
-		int			off,		/* Offset from start for cur tok */
-					tok_len;	/* Length (in bytes) of that tok */
-
-		off = jstate->clocations[i].location;
-		/* Adjust recorded location if we're dealing with partial string */
-		off -= query_loc;
-
-		tok_len = jstate->clocations[i].length;
-
-		if (tok_len < 0)
-			continue;			/* ignore any duplicates */
-
-		/* Copy next chunk (what precedes the next constant) */
-		len_to_wrt = off - last_off;
-		len_to_wrt -= last_tok_len;
-
-		Assert(len_to_wrt >= 0);
-		memcpy(norm_query + n_quer_loc, query + quer_loc, len_to_wrt);
-		n_quer_loc += len_to_wrt;
-
-		/* And insert a param symbol in place of the constant token */
-		n_quer_loc += sprintf(norm_query + n_quer_loc, "$%d",
-							  i + 1 + jstate->highest_extern_param_id);
-
-		quer_loc = off + tok_len;
-		last_off = off;
-		last_tok_len = tok_len;
-	}
-
-	/*
-	 * We've copied up until the last ignorable constant.  Copy over the
-	 * remaining bytes of the original query string.
-	 */
-	len_to_wrt = query_len - quer_loc;
-
-	Assert(len_to_wrt >= 0);
-	memcpy(norm_query + n_quer_loc, query + quer_loc, len_to_wrt);
-	n_quer_loc += len_to_wrt;
-
-	Assert(n_quer_loc <= norm_query_buflen);
-	norm_query[n_quer_loc] = '\0';
-
-	*query_len_p = n_quer_loc;
-	return norm_query;
-}
-
-/*
- * Given a valid SQL string and an array of constant-location records,
- * fill in the textual lengths of those constants.
- *
- * The constants may use any allowed constant syntax, such as float literals,
- * bit-strings, single-quoted strings and dollar-quoted strings.  This is
- * accomplished by using the public API for the core scanner.
- *
- * It is the caller's job to ensure that the string is a valid SQL statement
- * with constants at the indicated locations.  Since in practice the string
- * has already been parsed, and the locations that the caller provides will
- * have originated from within the authoritative parser, this should not be
- * a problem.
- *
- * Duplicate constant pointers are possible, and will have their lengths
- * marked as '-1', so that they are later ignored.  (Actually, we assume the
- * lengths were initialized as -1 to start with, and don't change them here.)
- *
- * If query_loc > 0, then "query" has been advanced by that much compared to
- * the original string start, so we need to translate the provided locations
- * to compensate.  (This lets us avoid re-scanning statements before the one
- * of interest, so it's worth doing.)
- *
- * N.B. There is an assumption that a '-' character at a Const location begins
- * a negative numeric constant.  This precludes there ever being another
- * reason for a constant to start with a '-'.
- */
-static void
-fill_in_constant_lengths(JumbleState *jstate, const char *query,
-						 int query_loc)
-{
-	LocationLen		*locs;
-	core_yyscan_t		yyscanner;
-	core_yy_extra_type	yyextra;
-	core_YYSTYPE		yylval;
-	YYLTYPE				yylloc;
-	int					last_loc = -1;
-	int					i;
-
-	/*
-	 * Sort the records by location so that we can process them in order while
-	 * scanning the query text.
-	 */
-	if (jstate->clocations_count > 1)
-		qsort(jstate->clocations, jstate->clocations_count,
-			  sizeof(LocationLen), comp_location);
-	locs = jstate->clocations;
-
-	/* initialize the flex scanner --- should match raw_parser() */
-	yyscanner = scanner_init(query,
-							 &yyextra,
-#if PG_VERSION_NUM >= 120000
-							&ScanKeywords,
-							ScanKeywordTokens);
-#else
-							ScanKeywords,
-							NumScanKeywords);
-#endif
-	/* we don't want to re-emit any escape string warnings */
-	yyextra.escape_string_warning = false;
-
-	/* Search for each constant, in sequence */
-	for (i = 0; i < jstate->clocations_count; i++)
-	{
-		int			loc = locs[i].location;
-		int			tok;
-
-		/* Adjust recorded location if we're dealing with partial string */
-		loc -= query_loc;
-
-		Assert(loc >= 0);
-
-		if (loc <= last_loc)
-			continue;			/* Duplicate constant, ignore */
-
-		/* Lex tokens until we find the desired constant */
-		for (;;)
-		{
-			tok = core_yylex(&yylval, &yylloc, yyscanner);
-
-			/* We should not hit end-of-string, but if we do, behave sanely */
-			if (tok == 0)
-				break;			/* out of inner for-loop */
-
-			/*
-			 * We should find the token position exactly, but if we somehow
-			 * run past it, work with that.
-			 */
-			if (yylloc >= loc)
-			{
-				if (query[loc] == '-')
-				{
-					/*
-					 * It's a negative value - this is the one and only case
-					 * where we replace more than a single token.
-					 *
-					 * Do not compensate for the core system's special-case
-					 * adjustment of location to that of the leading '-'
-					 * operator in the event of a negative constant.  It is
-					 * also useful for our purposes to start from the minus
-					 * symbol.  In this way, queries like "select * from foo
-					 * where bar = 1" and "select * from foo where bar = -2"
-					 * will have identical normalized query strings.
-					 */
-					tok = core_yylex(&yylval, &yylloc, yyscanner);
-					if (tok == 0)
-						break;	/* out of inner for-loop */
-				}
-
-				/*
-				 * We now rely on the assumption that flex has placed a zero
-				 * byte after the text of the current token in scanbuf.
-				 */
-				locs[i].length = strlen(yyextra.scanbuf + loc);
-				break;			/* out of inner for-loop */
-			}
-		}
-
-		/* If we hit end-of-string, give up, leaving remaining lengths -1 */
-		if (tok == 0)
-			break;
-
-		last_loc = loc;
-	}
-
-	scanner_finish(yyscanner);
-}
-
-/*
- * comp_location: comparator for qsorting LocationLen structs by location
- */
-static int
-comp_location(const void *a, const void *b)
-{
-	int	l = ((const LocationLen *) a)->location;
-	int	r = ((const LocationLen *) b)->location;
-
-	if (l < r)
-		return -1;
-	else if (l > r)
-		return +1;
-	else
-		return 0;
-}
-
-#define MAX_STRING_LEN	1024
-/* Convert array into Text dataum */
-static Datum
-intarray_get_datum(int32 arr[], int len)
-{
-	int     j;
-	char    str[1024];
-	char    tmp[10];
-	bool    first = true;
-
-	memset(str, 0, sizeof(str));
-
-	/* Need to calculate the actual size, and avoid unnessary memory usage */
-	for (j = 0; j < len; j++)
-	{
-		if (first)
-		{
-			snprintf(tmp, 10, "%d", arr[j]);
-			strcat(str,tmp);
-			first = false;
-			continue;
-		}
-		snprintf(tmp, 10, ",%d", arr[j]);
-		strcat(str,tmp);
-	}
-	return CStringGetTextDatum(str);
-
-}
-
-uint64
-read_query(unsigned char *buf, uint64 queryid, char * query, size_t pos)
-{
-	bool found            = false;
-	uint64 query_id       = 0;
-	uint64 query_len      = 0;
-	uint64 rlen           = 0;
-	uint64 buf_len        = 0;
-
-	memcpy(&buf_len, buf, sizeof (uint64));
-	if (buf_len <= 0)
-		goto exit;
-
-	/* If a position hint is given, try to locate the query directly. */
-	if (pos != 0 && (pos + sizeof(uint64) + sizeof(uint64)) < buf_len)
-	{
-		memcpy(&query_id, &buf[pos], sizeof(uint64));
-		if (query_id != queryid)
-			return 0;
-
-		pos += sizeof(uint64);
-
-		memcpy(&query_len, &buf[pos], sizeof(uint64)); /* query len */
-		pos += sizeof(uint64);
-
-		if (pos + query_len > buf_len) /* avoid reading past buffer's length. */
-			return 0;
-
-		memcpy(query, &buf[pos], query_len); /* Actual query */
-		query[query_len] = '\0';
-
-		return queryid;
-	}
-
-	rlen = sizeof (uint64); /* Move forwad to skip length bytes */
-	for(;;)
-	{
-		if (rlen >= buf_len)
-			goto exit;
-
-		memcpy(&query_id, &buf[rlen], sizeof (uint64)); /* query id */
-		if (query_id == queryid)
-			found = true;
-
-		rlen += sizeof (uint64);
-		if (buf_len <= rlen)
-			continue;
-
-		memcpy(&query_len, &buf[rlen], sizeof (uint64)); /* query len */
-		rlen += sizeof (uint64);
-		if (buf_len < rlen + query_len)
-			goto exit;
-		if (found)
-		{
-			if (query != NULL)
-			{
-				memcpy(query, &buf[rlen], query_len); /* Actual query */
-				query[query_len] = 0;
-			}
-			return query_id;
-		}
-		rlen += query_len;
-	}
-exit:
-	if (PGSM_OVERFLOW_TARGET == OVERFLOW_TARGET_NONE)
-	{
-		sprintf(query, "%s", "<insufficient shared space>");
-		return -1;
-	}
-	return 0;
-}
-
-bool
-SaveQueryText(uint64 bucketid,
-			  uint64 queryid,
-			  unsigned char *buf,
-			  const char *query,
-			  uint64 query_len,
-			  size_t *query_pos)
-{
-	uint64 buf_len = 0;
-
-	memcpy(&buf_len, buf, sizeof (uint64));
-	if (buf_len == 0)
-		buf_len += sizeof (uint64);
-
-	if (QUERY_BUFFER_OVERFLOW(buf_len, query_len))
-	{
-		switch(PGSM_OVERFLOW_TARGET)
-		{
-			case OVERFLOW_TARGET_NONE:
-				return false;
-			case OVERFLOW_TARGET_DISK:
-			{
-				bool dump_ok;
-
-				/*
-				 * If the query buffer is empty, there is nothing to dump, this also
-				 * means that the current query length exceeds MAX_QUERY_BUFFER_BUCKET.
-				 */
-				if (buf_len <= sizeof (uint64))
-					return false;
-
-				dump_ok = dump_queries_buffer(bucketid, buf, MAX_QUERY_BUFFER_BUCKET);
-				buf_len = sizeof (uint64);
-
-				/*
-				 * We must check for overflow again, as the query length may
-				 * exceed the size allocated to the buffer (MAX_QUERY_BUFFER_BUCKET).
-				 */
-				if (QUERY_BUFFER_OVERFLOW(buf_len, query_len))
-				{
-					/*
-					 * If we successfully dumped the query buffer to disk, then
-					 * reset the buffer, otherwise we could end up dumping the
-					 * same buffer again.
-					 */
-					if (dump_ok)
-						*(uint64 *)buf = 0;
-
-					return false;
-				}
-
-			}
-			break;
-			default:
-				Assert(false);
-				break;
-		}
-	}
-
-	*query_pos = buf_len;
-
-	memcpy(&buf[buf_len], &queryid, sizeof (uint64)); /* query id */
-	buf_len += sizeof (uint64);
-
-	memcpy(&buf[buf_len], &query_len, sizeof (uint64)); /* query length */
-	buf_len += sizeof (uint64);
-
-	memcpy(&buf[buf_len], query, query_len); /* query */
-	buf_len += query_len;
-	memcpy(buf, &buf_len, sizeof (uint64));
-	return true;
 }
 
 
@@ -3047,357 +2564,118 @@ pg_stat_monitor_settings(PG_FUNCTION_ARGS)
 	return (Datum)0;
 }
 
+Datum
+pg_stat_monitor_hook_stats(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo		*rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc			tupdesc;
+	Tuplestorestate		*tupstore;
+	MemoryContext		per_query_ctx;
+	MemoryContext		oldcontext;
+	enum pg_hook_stats_id hook_id;
+
+	/* Safety check... */
+	if (!IsSystemInitialized())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_stat_monitor: must be loaded via shared_preload_libraries")));
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_stat_monitor: set-valued function called in context that cannot accept a set")));
+
+	/* Switch into long-lived context to construct returned data structures */
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "pg_stat_monitor: return type must be a row type");
+
+	if (tupdesc->natts != 5)
+		elog(ERROR, "pg_stat_monitor: incorrect number of output arguments, required %d", tupdesc->natts);
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	for (hook_id = 0; hook_id < STATS_END; hook_id++)
+	{
+		Datum		values[5];
+		bool		nulls[5];
+		int			j = 0;
+		memset(values, 0, sizeof(values));
+		memset(nulls, 0, sizeof(nulls));
+
+		values[j++] = CStringGetTextDatum(pg_hook_stats[hook_id].hook_name);
+		values[j++] = Float8GetDatumFast(pg_hook_stats[hook_id].min_time);
+		values[j++] = Float8GetDatumFast(pg_hook_stats[hook_id].max_time);
+		values[j++] = Float8GetDatumFast(pg_hook_stats[hook_id].total_time);
+		values[j++] = Int64GetDatumFast(pg_hook_stats[hook_id].ncalls);
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+	/* clean up and return the tuplestore */
+	tuplestore_donestoring(tupstore);
+	return (Datum)0;
+}
+
 void
 set_qbuf(int i, unsigned char *buf)
 {
 	pgss_qbuf[i] = buf;
 }
 
-void
-pgsm_emit_log_hook(ErrorData *edata)
-{
-	if (!IsSystemInitialized() || edata == NULL)
-		goto exit;
-
-	if (IsParallelWorker())
-		return;
-
-	/* Check if PostgreSQL has finished its own bootstraping code. */
-	if (MyProc == NULL)
-		return;
-
-	if ((edata->elevel == ERROR || edata->elevel == WARNING || edata->elevel == INFO || edata->elevel == DEBUG1))
-	{
-		uint64 queryid = 0;
-
-		if (debug_query_string)
-			queryid = DatumGetUInt64(hash_any_extended((const unsigned char *)debug_query_string, strlen(debug_query_string), 0));
-
-		pgss_store_error(queryid,
-						debug_query_string ? debug_query_string : "",
-						edata);
-	}
-exit:
-	if (prev_emit_log_hook)
-        prev_emit_log_hook(edata);
-}
-
-bool
-IsSystemInitialized(void)
-{
-	return (system_init && IsHashInitialize());
-}
-
-static bool
-dump_queries_buffer(int bucket_id, unsigned char *buf, int buf_len)
-{
-	int  fd = 0;
-	char file_name[1024];
-	bool success = true;
-	int  off = 0;
-	int  tries = 0;
-
-	snprintf(file_name, 1024, "%s.%d", PGSM_TEXT_FILE, bucket_id);
-	fd = OpenTransientFile(file_name, O_RDWR | O_CREAT | O_APPEND | PG_BINARY);
-	if (fd < 0)
-	{
-		ereport(LOG,
-            (errcode_for_file_access(),
-             	errmsg("could not write file \"%s\": %m",
-                    		file_name)));
-		return false;
-	}
-
-	/* Loop until write buf_len bytes to the file. */
-	do {
-		ssize_t nwrite = write(fd, buf + off, buf_len - off);
-		if (nwrite == -1)
-		{
-			if (errno == EINTR && tries++ < 3)
-				continue;
-
-			success = false;
-			break;
-		}
-		off += nwrite;
-	} while (off < buf_len);
-
-	if (!success)
-		ereport(LOG,
-			(errcode_for_file_access(),
-				errmsg("could not write file \"%s\": %m", file_name)));
-
-    if (fd > 0)
-		CloseTransientFile(fd);
-
-	return success;
-}
-
-/*
- * Try to locate query text in a dumped file for bucket_id.
- *
- * Returns:
- *    1   Query sucessfully read, query_text will contain the query text.
- *    0   Query not found.
- *   -1   I/O Error.
- */
-int
-read_query_buffer(int bucket_id, uint64 queryid, char *query_txt, size_t pos)
-{
-    int           fd = 0;
-	char          file_name[1024];
-	unsigned char *buf = NULL;
-	ssize_t       nread = 0;
-	int           off = 0;
-	int           tries = 0;
-	bool          done = false;
-	bool          found = false;
-
-	snprintf(file_name, 1024, "%s.%d", PGSM_TEXT_FILE, bucket_id);
-    fd = OpenTransientFile(file_name, O_RDONLY | PG_BINARY);
-	if (fd < 0)
-		goto exit;
-
-	buf = (unsigned char*) palloc(MAX_QUERY_BUFFER_BUCKET);
-	while (!done)
-	{
-		off = 0;
-		/* read a chunck of MAX_QUERY_BUFFER_BUCKET size. */
-		do {
-			nread = read(fd, buf + off, MAX_QUERY_BUFFER_BUCKET - off);
-			if (nread == -1)
-			{
-				if (errno == EINTR && tries++ < 3)  /* read() was interrupted, attempt to read again (max attempts=3) */
-					continue;
-
-				goto exit;
-			}
-			else if (nread == 0) /* EOF */
-			{
-				done = true;
-				break;
-			}
-
-			off += nread;
-		} while (off < MAX_QUERY_BUFFER_BUCKET);
-
-		if (off == MAX_QUERY_BUFFER_BUCKET)
-		{
-			/* we have a chunck, scan it looking for queryid. */
-			if (read_query(buf, queryid, query_txt, pos) != 0)
-			{
-
-				found = true;
-				/* query was found, don't need to read another chunck. */
-				break;
-			}
-		}
-		else
-			/*
-			 * Either done=true or file has a size not multiple of MAX_QUERY_BUFFER_BUCKET.
-			 * It is safe to assume that the file was truncated or corrupted.
-			 */
-			break;
-	}
-
-exit:
-	if (fd < 0 || nread == -1)
-		ereport(LOG,
-			(errcode_for_file_access(),
-				errmsg("could not read file \"%s\": %m",
-					file_name)));
-
-	if (fd >= 0)
-    	CloseTransientFile(fd);
-
-	if (buf)
-		pfree(buf);
-
-	if (found)
-		return 1;
-	else if (fd == -1 || nread == -1)
-		return -1; /* I/O error. */
-	else
-		return 0;  /* Not found. */
-}
-
-static double
-time_diff(struct timeval end, struct timeval start)
-{
-	double mstart;
-	double mend;
-	mend = ((double) end.tv_sec * 1000.0 + (double) end.tv_usec / 1000.0);
-	mstart   = ((double) start.tv_sec * 1000.0 + (double) start.tv_usec / 1000.0);
-	return mend - mstart;
-}
-
-char *
-unpack_sql_state(int sql_state)
-{
-    static char buf[12];
-    int         i;
-
-    for (i = 0; i < 5; i++)
-    {
-        buf[i] = PGUNSIXBIT(sql_state);
-        sql_state >>= 6;
-    }
-
-    buf[i] = '\0';
-    return buf;
-}
-
-static int
-get_histogram_bucket(double q_time)
-{
-	double q_min = PGSM_HISTOGRAM_MIN;
-	double q_max = PGSM_HISTOGRAM_MAX;
-	int    b_count = PGSM_HISTOGRAM_BUCKETS;
-	int    index = 0;
-	double b_max;
-	double b_min;
-	double bucket_size;
-
-	q_time -= q_min;
-
-	b_max = log(q_max - q_min);
-	b_min = 0;
-
-	bucket_size = (b_max - b_min) / (double)b_count;
-
-	for(index = 1; index <= b_count; index++)
-	{
-		int64 b_start = (index == 1)? 0 : exp(bucket_size * (index - 1));
-		int64 b_end = exp(bucket_size * index);
-		if( (index == 1 && q_time < b_start)
-			|| (q_time >= b_start && q_time <= b_end)
-			|| (index == b_count && q_time > b_end) )
-		{
-			return index - 1;
-		}
-	}
-	return 0;
-}
-
-Datum
-get_histogram_timings(PG_FUNCTION_ARGS)
-{
-	double q_min = PGSM_HISTOGRAM_MIN;
-	double q_max = PGSM_HISTOGRAM_MAX;
-	int    b_count = PGSM_HISTOGRAM_BUCKETS;
-	int    index = 0;
-	double b_max;
-	double b_min;
-	double bucket_size;
-	bool	first = true;
-	char    *tmp_str = palloc0(MAX_STRING_LEN);
-	char    *text_str = palloc0(MAX_STRING_LEN);
-
-	b_max = log(q_max - q_min);
-	b_min = 0;
-	bucket_size = (b_max - b_min) / (double)b_count;
-	for(index = 1; index <= b_count; index++)
-	{
-		int64 b_start = (index == 1)? 0 : exp(bucket_size * (index - 1));
-		int64 b_end = exp(bucket_size * index);
-		if (first)
-		{
-			snprintf(text_str, MAX_STRING_LEN, "(%ld - %ld)}", b_start, b_end);
-			first = false;
-		}
-		else
-		{
-			snprintf(tmp_str, MAX_STRING_LEN, "%s, (%ld - %ld)}", text_str, b_start, b_end);
-			snprintf(text_str, MAX_STRING_LEN, "%s", tmp_str);
-		}
-	}
-	pfree(tmp_str);
-	return CStringGetTextDatum(text_str);
-}
-
 static void
-extract_query_comments(const char *query, char *comments, size_t max_len)
+pgsm_emit_log_hook_benchmark(ErrorData *edata)
 {
-	int        rc;
-	size_t     nmatch = 1;
-	regmatch_t pmatch;
-	regoff_t   comment_len, total_len = 0;
-	const char *s = query;
+	double start_time = (double)clock();
+	pgsm_emit_log_hook(edata);
+	double elapsed = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+	update_hook_stats(STATS_PGSM_EMIT_LOG_HOOK, elapsed);
+}
 
-	while (total_len < max_len)
+void init_hook_stats(void)
+{
+	bool found = false;
+	pg_hook_stats = ShmemInitStruct("pg_stat_monitor_hook_stats", HOOK_STATS_SIZE, &found);
+	if (!found)
 	{
-		rc = regexec(&preg_query_comments, s, nmatch, &pmatch, 0);
-		if (rc != 0)
-			break;
+		memset(pg_hook_stats, 0, HOOK_STATS_SIZE);
 
-		comment_len = pmatch.rm_eo - pmatch.rm_so;
+#define SET_HOOK_NAME(hook, name) \
+	snprintf(pg_hook_stats[hook].hook_name, sizeof(pg_hook_stats->hook_name), name);
 
-		if (total_len + comment_len > max_len)
-			break;  /* TODO: log error in error view, insufficient space for comment. */
-
-		total_len += comment_len;
-
-		/* Not 1st iteration, append ", " before next comment. */
-		if (s != query)
-		{
-			if (total_len + 2 > max_len)
-				break;  /* TODO: log error in error view, insufficient space for ", " + comment. */
-
-			memcpy(comments, ", ", 2);
-			comments += 2;
-			total_len += 2;
-		}
-
-		memcpy(comments, s + pmatch.rm_so, comment_len);
-		comments += comment_len;
-		s += pmatch.rm_eo;
+		SET_HOOK_NAME(STATS_PGSS_POST_PARSE_ANALYZE, "pgss_post_parse_analyze");
+		SET_HOOK_NAME(STATS_PGSS_EXECUTORSTART, "pgss_ExecutorStart");
+		SET_HOOK_NAME(STATS_PGSS_EXECUTORUN, "pgss_ExecutorRun");
+		SET_HOOK_NAME(STATS_PGSS_EXECUTORFINISH, "pgss_ExecutorFinish");
+		SET_HOOK_NAME(STATS_PGSS_EXECUTOREND, "pgss_ExecutorEnd");
+		SET_HOOK_NAME(STATS_PGSS_PROCESSUTILITY, "pgss_ProcessUtility");
+#if PG_VERSION_NUM >= 130000
+		SET_HOOK_NAME(STATS_PGSS_PLANNER_HOOK, "pgss_planner_hook");
+#endif
+		SET_HOOK_NAME(STATS_PGSM_EMIT_LOG_HOOK, "pgsm_emit_log_hook");
+		SET_HOOK_NAME(STATS_PGSS_EXECUTORCHECKPERMS, "pgss_ExecutorCheckPerms");
 	}
 }
 
-#if PG_VERSION_NUM < 140000
-static uint64
-get_query_id(JumbleState *jstate, Query *query)
+void update_hook_stats(enum pg_hook_stats_id hook_id, double time_elapsed)
 {
-	uint64 queryid;
+	Assert(hook_id > STATS_START && hook_id < STATS_END);
 
-	/* Set up workspace for query jumbling */
-	jstate->jumble = (unsigned char *) palloc(JUMBLE_SIZE);
-	jstate->jumble_len = 0;
-	jstate->clocations_buf_size = 32;
-	jstate->clocations = (LocationLen *) palloc(jstate->clocations_buf_size * sizeof(LocationLen));
-	jstate->clocations_count = 0;
-	jstate->highest_extern_param_id = 0;
+	struct pg_hook_stats_t *p = &pg_hook_stats[hook_id];
+	if (time_elapsed < p->min_time)
+		p->min_time = time_elapsed;
+	
+	if (time_elapsed > p->max_time)
+		p->max_time = time_elapsed;
 
-	/* Compute query ID and mark the Query node with it */
-	JumbleQuery(jstate, query);
-	queryid = DatumGetUInt64(hash_any_extended(jstate->jumble, jstate->jumble_len, 0));
-	return queryid;
+	p->total_time += time_elapsed;
+	p->ncalls++;
 }
 #endif
-
-static uint64 djb2_hash(unsigned char *str, size_t len)
-{
-	uint64 hash = 5381LLU;
-
-    while (len--)
-        hash = ((hash << 5) + hash) ^ *str++; // hash(i - 1) * 33 ^ str[i]
-
-    return hash;
-}
-
-uint64
-CurrentUserID(pgssStoreKind k)
-{
-    uint64 userid = 0;
-    if (k == PGSS_ERROR)
-    {
-        int sec_ctx;
-        GetUserIdAndSecContext((Oid *)&userid, &sec_ctx);
-    }
-    else
-    {
-        userid = GetUserId();
-    }
-    /* To keep compiler smilling */
-    return userid;
-}

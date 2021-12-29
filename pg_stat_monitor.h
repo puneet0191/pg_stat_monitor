@@ -161,6 +161,23 @@ typedef enum AGG_KEY
 
 #define MAX_QUERY_LEN 1024
 
+/* Global hash Table */
+typedef struct pgssGlobalHashKey
+{
+	uint64		bucket_id;		/* bucket number */
+	uint64		queryid;		/* query identifier */
+	uint64		userid;			/* user OID */
+	uint64		dbid;			/* database OID */
+	uint64		ip;				/* client ip address */
+	uint64		appid;			/* hash of application name */
+    uint64      toplevel;       /* query executed at top level */
+} pgssGlobalHashKey;
+
+typedef struct pgssGloablEntry
+{
+  int num;
+} pgssGlobalEntry;
+
 /* shared nenory storage for the query */
 typedef struct CallTime
 {
@@ -382,6 +399,7 @@ int pgsm_get_bucket_size(void);
 pgssSharedState* pgsm_get_ss(void);
 HTAB *pgsm_get_plan_hash(void);
 HTAB *pgsm_get_hash(void);
+HTAB *pgsm_get_global_hash(void);
 HTAB *pgsm_get_plan_hash(void);
 void hash_entry_reset(void);
 void hash_query_entryies_reset(void);
@@ -389,6 +407,7 @@ void hash_query_entries();
 void hash_query_entry_dealloc(int new_bucket_id, int old_bucket_id, unsigned char *query_buffer[]);
 void hash_entry_dealloc(int new_bucket_id, int old_bucket_id, unsigned char *query_buffer[]);
 pgssEntry* hash_entry_alloc(pgssSharedState *pgss, pgssHashKey *key, int encoding);
+pgssGlobalEntry* hash_global_entry_alloc(pgssSharedState *pgss, pgssGlobalHashKey *key);
 Size hash_memsize(void);
 
 int read_query_buffer(int bucket_id, uint64 queryid, char *query_txt, size_t pos);
